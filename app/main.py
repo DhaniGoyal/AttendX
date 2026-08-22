@@ -1,4 +1,10 @@
-from .notion_integration import create_review_request, create_run_log
+from .notion_integration import (
+    create_review_request,
+    create_run_log,
+    get_approved_requests,
+    get_page_roll_no
+)
+
 from .face_verification import compare_faces
 from fastapi import FastAPI
 from .database import engine, Base
@@ -529,6 +535,10 @@ AttendX
         request.status = "Approved"
         db.commit()
 
+        create_run_log(
+            f"Warning approved and dispatched - Roll No {student.roll_no}"
+        )
+
         return {
             "message": "Warning approved and dispatched",
             "roll_no": student.roll_no,
@@ -547,10 +557,119 @@ AttendX
     finally:
         db.close()
 
-    return {
-        "message": "Warning approved and dispatched",
-        "roll_no": student.roll_no,
-        "attendance_percentage": attendance,
-        "status": "Approved",
-        "pdf_path": pdf_path
-    }
+
+@app.get("/notion-approved")
+def notion_approved():
+    try:
+        requests = get_approved_requests()
+
+        return {
+            "approved_count": len(requests),
+            "approved_requests": requests
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+
+
+
+@app.post("/process-notion-approvals")
+def process_notion_approvals():
+    db = SessionLocal()
+    processed = []
+
+    try:
+        approved_requests = get_approved_requests()
+
+        for page in approved_requests:
+
+            roll_no = get_page_roll_no(page)
+
+            if roll_no is None:
+                continue
+
+            request = db.query(WarningRequest).filter(
+                WarningRequest.roll_no == str(roll_no),
+                WarningRequest.status == "Pending",
+                WarningRequest.dispatched == 0
+            ).first()
+
+            if not request:
+                continue
+
+            student = db.query(Student).filter(
+                Student.roll_no == str(roll_no)
+            ).first()
+
+            if not student:
+                continue
+
+            if student.total_classes == 0:
+                continue
+
+            attendance = (
+                student.attended / student.total_classes
+            ) * 100
+
+            pdf_path = generate_warning_pdf(
+                student.name,
+                student.roll_no,
+                student.total_classes,
+                student.attended,
+                attendance
+            )
+
+            send_email(
+                to_email="vaanigoel50@gmail.com",
+                subject="AttendX Attendance Warning",
+                body=f"""
+Dear Student,
+
+Your attendance is below the required minimum of 75%.
+
+Student Name: {student.name}
+Roll Number: {student.roll_no}
+Attendance: {attendance:.2f}%
+
+Please maintain regular attendance.
+
+Regards,
+AttendX
+""",
+                pdf_path=pdf_path
+            )
+
+            request.status = "Approved"
+            request.dispatched = 1
+
+            db.commit()
+
+            create_run_log(
+                f"Automatic warning dispatched - Roll No {student.roll_no}"
+            )
+
+            processed.append({
+                "roll_no": student.roll_no,
+                "attendance_percentage": attendance,
+                "status": "Dispatched"
+            })
+
+        return {
+            "processed_count": len(processed),
+            "processed": processed
+        }
+
+    except Exception as e:
+        db.rollback()
+
+        return {
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+    finally:
+        db.close()

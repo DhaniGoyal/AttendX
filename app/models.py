@@ -26,3 +26,4 @@ class WarningRequest(Base):
     id = Column(Integer, primary_key=True, index=True)
     roll_no = Column(String, index=True)
     status = Column(String, default="Pending")
+    dispatched = Column(Integer, default=0)
