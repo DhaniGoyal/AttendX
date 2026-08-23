@@ -2,8 +2,11 @@ from .notion_integration import (
     create_review_request,
     create_run_log,
     get_approved_requests,
-    get_page_roll_no
+    get_professor_decision_requests,
+    get_page_roll_no,
+    get_professor_decision
 )
+
 
 from .face_verification import compare_faces
 from fastapi import FastAPI
@@ -367,14 +370,43 @@ def verify_check_in(roll_no: str):
             "message": result["message"]
         }
 
-    # Face match nahi hua
+    # Face match nahi hua → Proxy request create
     if result["status"] != "Present":
-        return {
-            "roll_no": roll_no,
-            "similarity": float(result["similarity"]),
-            "status": "Proxy Suspected",
-            "message": "Face verification failed. Attendance not marked."
-        }
+
+        db = SessionLocal()
+
+        try:
+            student = db.query(Student).filter(
+                Student.roll_no == roll_no
+            ).first()
+
+            if not student:
+                return {
+                    "error": "Student not found"
+                }
+
+            create_review_request(
+                roll_no=student.roll_no,
+                student_name=student.name,
+                issue_type="Proxy Flag",
+                rule_reason="Face verification failed. Proxy suspected.",
+                status="Pending"
+            )
+
+            create_run_log(
+                f"Proxy suspected - Roll No {student.roll_no}"
+            )
+
+            return {
+                "roll_no": roll_no,
+                "name": student.name,
+                "similarity": float(result["similarity"]),
+                "status": "Proxy Suspected",
+                "message": "Face verification failed. Proxy request sent for review."
+            }
+
+        finally:
+            db.close()
 
     # Student database se find karo
     db = SessionLocal()
@@ -419,6 +451,66 @@ def verify_check_in(roll_no: str):
         "attendance_percentage": attendance
     }
 
+
+
+
+
+@app.post("/leave-request/{roll_no}")
+def create_leave_request(roll_no: str):
+    db = SessionLocal()
+
+    try:
+        student = db.query(Student).filter(
+            Student.roll_no == roll_no
+        ).first()
+
+        if not student:
+            return {
+                "error": "Student not found"
+            }
+
+        attendance = 0
+
+        if student.total_classes > 0:
+            attendance = (
+                student.attended / student.total_classes
+            ) * 100
+
+        create_review_request(
+            roll_no=student.roll_no,
+            student_name=student.name,
+            issue_type="Leave Request",
+            attendance_percentage=attendance,
+            rule_reason="Student submitted a leave request",
+            status="Pending"
+        )
+
+        create_run_log(
+            f"Leave request created - Roll No {student.roll_no}"
+        )
+
+        return {
+            "message": "Leave request created",
+            "roll_no": student.roll_no,
+            "name": student.name,
+            "attendance_percentage": attendance,
+            "issue_type": "Leave Request",
+            "status": "Pending"
+        }
+
+    except Exception as e:
+        db.rollback()
+        return {
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
+    finally:
+        db.close()
+
+
+
+
 @app.post("/warning-request/{roll_no}")
 def create_warning_request(roll_no: str):
     db = SessionLocal()
@@ -442,6 +534,22 @@ def create_warning_request(roll_no: str):
                 "attendance_percentage": attendance
             }
 
+        # Check if an active warning already exists
+        existing_request = db.query(WarningRequest).filter(
+            WarningRequest.roll_no == student.roll_no,
+            WarningRequest.dispatched == 0
+        ).first()
+
+        if existing_request:
+            return {
+                "message": "Warning request already exists",
+                "request_id": existing_request.id,
+                "roll_no": student.roll_no,
+                "attendance_percentage": attendance,
+                "status": existing_request.status
+            }
+
+        # Create new warning request
         request = WarningRequest(
             roll_no=student.roll_no,
             status="Pending"
@@ -453,6 +561,11 @@ def create_warning_request(roll_no: str):
 
         create_review_request(
             roll_no=student.roll_no,
+            student_name=student.name,
+            issue_type="Defaulter",
+            attendance_percentage=attendance,
+            rule_reason="Attendance below 75%",
+            request_id=request.id,
             status="Pending"
         )
 
@@ -583,50 +696,131 @@ def process_notion_approvals():
     processed = []
 
     try:
-        approved_requests = get_approved_requests()
+        approved_requests = get_professor_decision_requests()
 
         for page in approved_requests:
 
             roll_no = get_page_roll_no(page)
+            issue_type = get_page_issue_type(page)
 
-            if roll_no is None:
+            if roll_no is None or issue_type is None:
                 continue
 
-            request = db.query(WarningRequest).filter(
-                WarningRequest.roll_no == str(roll_no),
-                WarningRequest.status == "Pending",
-                WarningRequest.dispatched == 0
-            ).first()
+            decision = get_professor_decision(page)
 
-            if not request:
+            if decision is None or decision == "Pending":
                 continue
 
-            student = db.query(Student).filter(
-                Student.roll_no == str(roll_no)
-            ).first()
 
-            if not student:
+            # -----------------------------
+            # REJECT
+            # -----------------------------
+            if decision == "reject":
+
+                update_request_status(
+                    page["id"],
+                    "Rejected"
+                )
+
+                create_run_log(
+                    f"Request rejected - Roll No {roll_no} - {issue_type}"
+                )
+
+                processed.append({
+                    "roll_no": str(roll_no),
+                    "issue_type": issue_type,
+                    "status": "Rejected"
+                })
+
                 continue
 
-            if student.total_classes == 0:
+
+            # -----------------------------
+            # LEAVE REQUEST
+            # -----------------------------
+            if issue_type == "Leave Request":
+
+                update_request_status(
+                    page["id"],
+                    "Approved"
+                )
+
+                create_run_log(
+                    f"Leave request approved - Roll No {roll_no}"
+                )
+
+                processed.append({
+                    "roll_no": str(roll_no),
+                    "issue_type": "Leave Request",
+                    "status": "Approved"
+                })
+
                 continue
 
-            attendance = (
-                student.attended / student.total_classes
-            ) * 100
 
-            pdf_path = generate_warning_pdf(
-                student.name,
-                student.roll_no,
-                student.total_classes,
-                student.attended,
-                attendance
-            )
+            # -----------------------------
+            # PROXY FLAG
+            # -----------------------------
+            if issue_type == "Proxy Flag":
 
-            send_email(
-                to_email="vaanigoel50@gmail.com",
-                subject="AttendX Attendance Warning",
-                body=f"""
+                update_request_status(
+                    page["id"],
+                    "Approved"
+                )
+
+                create_run_log(
+                    f"Proxy flag approved - Roll No {roll_no}"
+                )
+
+                processed.append({
+                    "roll_no": str(roll_no),
+                    "issue_type": "Proxy Flag",
+                    "status": "Approved"
+                 })
+
+                continue
+
+
+            # -----------------------------
+            # DEFAULTER / WARNING REQUEST
+            # -----------------------------
+            if issue_type == "Defaulter":
+
+                request = db.query(WarningRequest).filter(
+                    WarningRequest.roll_no == str(roll_no),
+                    WarningRequest.status == "Pending",
+                    WarningRequest.dispatched == 0
+                ).first()
+
+                if not request:
+                    continue
+
+                student = db.query(Student).filter(
+                    Student.roll_no == str(roll_no)
+                ).first()
+
+                if not student:
+                    continue
+
+                if student.total_classes == 0:
+                    continue
+
+                attendance = (
+                    student.attended / student.total_classes
+                ) * 100
+
+                pdf_path = generate_warning_pdf(
+                    student.name,
+                    student.roll_no,
+                    student.total_classes,
+                    student.attended,
+                    attendance
+                )
+
+                send_email(
+                    to_email="vaanigoel50@gmail.com",
+                    subject="AttendX Attendance Warning",
+                    body=f"""
 Dear Student,
 
 Your attendance is below the required minimum of 75%.
@@ -640,23 +834,29 @@ Please maintain regular attendance.
 Regards,
 AttendX
 """,
-                pdf_path=pdf_path
-            )
+                    pdf_path=pdf_path
+                )
 
-            request.status = "Approved"
-            request.dispatched = 1
+                request.status = "Approved"
+                request.dispatched = 1
 
-            db.commit()
+                db.commit()
 
-            create_run_log(
-                f"Automatic warning dispatched - Roll No {student.roll_no}"
-            )
+                update_request_status(
+                    page["id"],
+                    "Dispatched"
+                )
 
-            processed.append({
-                "roll_no": student.roll_no,
-                "attendance_percentage": attendance,
-                "status": "Dispatched"
-            })
+                create_run_log(
+                    f"Automatic warning dispatched - Roll No {student.roll_no}"
+                )
+
+                processed.append({
+                    "roll_no": student.roll_no,
+                    "issue_type": "Defaulter",
+                    "attendance_percentage": attendance,
+                    "status": "Dispatched"
+                })
 
         return {
             "processed_count": len(processed),
